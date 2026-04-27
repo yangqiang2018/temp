@@ -356,6 +356,8 @@ def _build_gather_reduce_kernel_cast(
     idx_dtype,
 ):
     HALF_H = TILE_H // 2
+    n_octs = topK // 8
+    remainder = topK % 8
 
     @tilelang.jit(out_idx=[2], pass_configs=PASS_CONFIGS_EXPERT)
     def _build(
@@ -373,6 +375,8 @@ def _build_gather_reduce_kernel_cast(
         n_batches,
         dtype,
         idx_dtype,
+        n_octs,
+        remainder,
     ):
         @T.prim_func
         def moe_token_permute_grad(
@@ -383,13 +387,16 @@ def _build_gather_reduce_kernel_cast(
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
                 row_buf0 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf1 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf2 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf3 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf4 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf5 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf6 = T.alloc_ub([1, HALF_H], dtype)
-                row_buf7 = T.alloc_ub([1, HALF_H], dtype)
+                # row_buf1..row_buf7 only when topK >= 8 — otherwise unused
+                # buffers get pruned by memory planning, breaking codegen.
+                if n_octs > 0:
+                    row_buf1 = T.alloc_ub([1, HALF_H], dtype)
+                    row_buf2 = T.alloc_ub([1, HALF_H], dtype)
+                    row_buf3 = T.alloc_ub([1, HALF_H], dtype)
+                    row_buf4 = T.alloc_ub([1, HALF_H], dtype)
+                    row_buf5 = T.alloc_ub([1, HALF_H], dtype)
+                    row_buf6 = T.alloc_ub([1, HALF_H], dtype)
+                    row_buf7 = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
                 acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
                 out_buf = T.alloc_ub([1, HALF_H], dtype)
@@ -410,60 +417,58 @@ def _build_gather_reduce_kernel_cast(
 
                                     T.tile.fill(acc_buf, 0.0)
 
-                                    n_octs = topK // 8
-                                    remainder = topK % 8
-
-                                    for j8 in T.serial(n_octs):
-                                        j = j8 * 8
-                                        src0 = idx_ub[0, tk_off + j]
-                                        src1 = idx_ub[0, tk_off + j + 1]
-                                        src2 = idx_ub[0, tk_off + j + 2]
-                                        src3 = idx_ub[0, tk_off + j + 3]
-                                        src4 = idx_ub[0, tk_off + j + 4]
-                                        src5 = idx_ub[0, tk_off + j + 5]
-                                        src6 = idx_ub[0, tk_off + j + 6]
-                                        src7 = idx_ub[0, tk_off + j + 7]
-                                        T.copy(perm_grad_gm[src0, h_off], row_buf0)
-                                        T.copy(perm_grad_gm[src1, h_off], row_buf1)
-                                        T.copy(perm_grad_gm[src2, h_off], row_buf2)
-                                        T.copy(perm_grad_gm[src3, h_off], row_buf3)
-                                        T.copy(perm_grad_gm[src4, h_off], row_buf4)
-                                        T.copy(perm_grad_gm[src5, h_off], row_buf5)
-                                        T.copy(perm_grad_gm[src6, h_off], row_buf6)
-                                        T.copy(perm_grad_gm[src7, h_off], row_buf7)
-                                        T.barrier_all()
-                                        T.tile.cast(
-                                            row_f32, row_buf0, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf1, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf2, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf3, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf4, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf5, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf6, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(
-                                            row_f32, row_buf7, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.add(acc_buf, acc_buf, row_f32)
+                                    if n_octs > 0:
+                                        for j8 in T.serial(n_octs):
+                                            j = j8 * 8
+                                            src0 = idx_ub[0, tk_off + j]
+                                            src1 = idx_ub[0, tk_off + j + 1]
+                                            src2 = idx_ub[0, tk_off + j + 2]
+                                            src3 = idx_ub[0, tk_off + j + 3]
+                                            src4 = idx_ub[0, tk_off + j + 4]
+                                            src5 = idx_ub[0, tk_off + j + 5]
+                                            src6 = idx_ub[0, tk_off + j + 6]
+                                            src7 = idx_ub[0, tk_off + j + 7]
+                                            T.copy(perm_grad_gm[src0, h_off], row_buf0)
+                                            T.copy(perm_grad_gm[src1, h_off], row_buf1)
+                                            T.copy(perm_grad_gm[src2, h_off], row_buf2)
+                                            T.copy(perm_grad_gm[src3, h_off], row_buf3)
+                                            T.copy(perm_grad_gm[src4, h_off], row_buf4)
+                                            T.copy(perm_grad_gm[src5, h_off], row_buf5)
+                                            T.copy(perm_grad_gm[src6, h_off], row_buf6)
+                                            T.copy(perm_grad_gm[src7, h_off], row_buf7)
+                                            T.barrier_all()
+                                            T.tile.cast(
+                                                row_f32, row_buf0, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf1, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf2, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf3, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf4, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf5, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf6, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+                                            T.tile.cast(
+                                                row_f32, row_buf7, CAST_LOW2HIGH, HALF_H
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
 
                                     if remainder > 0:
                                         base = n_octs * 8
@@ -499,6 +504,8 @@ def _build_gather_reduce_kernel_cast(
         n_batches,
         dtype,
         idx_dtype,
+        n_octs,
+        remainder,
     )
 
 
@@ -517,6 +524,11 @@ def _build_gather_reduce_kernel_nocast(
     dtype,
     idx_dtype,
 ):
+    n_triples = topK // 3
+    remainder = topK % 3
+    need_buf1 = n_triples > 0 or remainder == 2
+    need_buf2 = n_triples > 0
+
     @tilelang.jit(out_idx=[2], pass_configs=PASS_CONFIGS)
     def _build(
         num_tokens,
@@ -532,6 +544,10 @@ def _build_gather_reduce_kernel_nocast(
         n_batches,
         dtype,
         idx_dtype,
+        n_triples,
+        remainder,
+        need_buf1,
+        need_buf2,
     ):
         @T.prim_func
         def moe_token_permute_grad(
@@ -542,8 +558,10 @@ def _build_gather_reduce_kernel_nocast(
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_shared([1, BATCH_T * topK], idx_dtype)
                 row_buf0 = T.alloc_shared([1, TILE_H], dtype)
-                row_buf1 = T.alloc_shared([1, TILE_H], dtype)
-                row_buf2 = T.alloc_shared([1, TILE_H], dtype)
+                if need_buf1:
+                    row_buf1 = T.alloc_shared([1, TILE_H], dtype)
+                if need_buf2:
+                    row_buf2 = T.alloc_shared([1, TILE_H], dtype)
                 acc_buf = T.alloc_shared([1, TILE_H], dtype)
 
                 for batch_id in T.serial(n_batches):
@@ -560,20 +578,18 @@ def _build_gather_reduce_kernel_nocast(
 
                                 T.tile.fill(acc_buf, 0.0)
 
-                                n_triples = topK // 3
-                                remainder = topK % 3
-
-                                for j3 in T.serial(n_triples):
-                                    j = j3 * 3
-                                    src_a = idx_ub[0, tk_off + j]
-                                    src_b = idx_ub[0, tk_off + j + 1]
-                                    src_c = idx_ub[0, tk_off + j + 2]
-                                    T.copy(perm_grad_gm[src_a, h_off], row_buf0)
-                                    T.copy(perm_grad_gm[src_b, h_off], row_buf1)
-                                    T.copy(perm_grad_gm[src_c, h_off], row_buf2)
-                                    T.tile.add(acc_buf, acc_buf, row_buf0)
-                                    T.tile.add(acc_buf, acc_buf, row_buf1)
-                                    T.tile.add(acc_buf, acc_buf, row_buf2)
+                                if n_triples > 0:
+                                    for j3 in T.serial(n_triples):
+                                        j = j3 * 3
+                                        src_a = idx_ub[0, tk_off + j]
+                                        src_b = idx_ub[0, tk_off + j + 1]
+                                        src_c = idx_ub[0, tk_off + j + 2]
+                                        T.copy(perm_grad_gm[src_a, h_off], row_buf0)
+                                        T.copy(perm_grad_gm[src_b, h_off], row_buf1)
+                                        T.copy(perm_grad_gm[src_c, h_off], row_buf2)
+                                        T.tile.add(acc_buf, acc_buf, row_buf0)
+                                        T.tile.add(acc_buf, acc_buf, row_buf1)
+                                        T.tile.add(acc_buf, acc_buf, row_buf2)
 
                                 if remainder == 2:
                                     base = n_triples * 3
@@ -607,6 +623,10 @@ def _build_gather_reduce_kernel_nocast(
         n_batches,
         dtype,
         idx_dtype,
+        n_triples,
+        remainder,
+        need_buf1,
+        need_buf2,
     )
 
 
