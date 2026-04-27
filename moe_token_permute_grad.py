@@ -83,9 +83,7 @@ def _build_gather_reduce_kernel_cast_group_pipelined(
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                # row_buf was [stages, topK, HALF_H]; flattened to 2D as
-                # [stages * topK, HALF_H] to satisfy the codegen's
-                # "no 3D slicing" rule. Indexed as row_buf[stage * topK + lane, :].
+
                 row_buf = T.alloc_ub([stages * topK, HALF_H], dtype)
                 row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
@@ -225,9 +223,7 @@ def _build_gather_reduce_kernel_cast_pipelined(
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                # row_buf was [stages, 1, HALF_H]; flattened to 2D to satisfy
-                # the codegen's "no 3D slicing" rule (the middle dim was
-                # always 1 anyway).
+
                 row_buf = T.alloc_ub([stages, HALF_H], dtype)
                 row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
@@ -377,13 +373,7 @@ def _build_gather_reduce_kernel_cast(
 ):
     assert topK >= 1, "cast kernel requires topK >= 1"
     HALF_H = TILE_H // 2
-    # row_buf is shape [LANES_PER_ITER, HALF_H]; row 1 onwards start at byte
-    # offset (HALF_H * dtype_bytes). NPU vector ops require 32B alignment, so
-    # when the per-row stride is below 32B (e.g. fp16 + small hidden where
-    # HALF_H*2 = 16B), strided access into row >= 1 raises ADDR_MISALIGN at
-    # runtime. Fall back to a single row in that case — the kernel then runs
-    # `n_iters = topK` sequential lane iterations against `row_buf[0, :]`,
-    # which has an aligned base address.
+
     dtype_bytes = 4 if dtype in ("float32", "float") else 2
     ALIGN_BYTES = 32
     if HALF_H * dtype_bytes >= ALIGN_BYTES:
@@ -421,11 +411,7 @@ def _build_gather_reduce_kernel_cast(
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                # Single 2D row_buf indexed by lane — same pattern as the
-                # unpermute kernel. Sized exactly to LANES_PER_ITER so every
-                # lane is referenced by the n_iters loop below; memory
-                # planning won't prune the buffer. row_tmp is the [1, HALF_H]
-                # flat copy target since T.tile.cast doesn't accept 2D slices.
+
                 row_buf = T.alloc_ub([LANES_PER_ITER, HALF_H], dtype)
                 row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
@@ -669,17 +655,6 @@ def _compile_gather_reduce(
 
     HALF_H_candidate = hidden_size // 2 if hidden_size % 2 == 0 else 0
 
-    # Pipelined kernels run on the V-half-split layout (HALF_H = TILE_H/2 per
-    # vector core) and were previously disabled because their row_buf used a
-    # 3D shape that the new codegen rejects. Both have now been flattened to
-    # 2D — lane-pipelined: [stages, HALF_H]; group-pipelined: [stages*topK,
-    # HALF_H] — so we can re-enable them whenever:
-    #   - cast path (fp16/bf16); fp32 has its own non-cast path
-    #   - single h-tile (hidden_size == TILE_H)
-    #   - HALF_H is well-defined and meets NPU 32B alignment + V-op width
-    # group_pipelined is the topK==8 specialization that double-buffers the
-    # whole 8-lane batch; lane_pipelined is the 8-stage prefetch that handles
-    # any topK <= 8.
     is_cast_path = dtype != CAL_DTYPE
     single_htile = hidden_size == TILE_H
     half_aligned = (
@@ -801,15 +776,6 @@ class MoeTokenPermuteGrad:
         self.E = num_tokens * topK
         self._out_len = num_out_tokens if num_out_tokens > 0 else self.E
 
-        # Match the min_compile_h floor used by MoeTokenPermute /
-        # MoeTokenUnpermute / MoeTokenUnpermuteGrad. The cast kernel runs
-        # T.tile.cast / T.tile.add over HALF_H-element tiles, and the NPU
-        # vector unit rejects sub-32B tile widths with "VEC supports illegal
-        # configurations in commands" (see issue #8 — hidden=16 fp16 ⇒
-        # HALF_H=8 ⇒ 16B-wide V-op trip). Enforcing HALF_H * dtype_bytes ≥
-        # 32B at compile time eliminates both that V-op width problem and
-        # the strided-row alignment problem that the LANES_PER_ITER=1
-        # fallback was patching around.
         min_compile_h = 64 if _is_fp32(dtype) else 32
         self._compile_hidden_size = max(hidden_size, min_compile_h)
         compile_tile_h = TILE_H if TILE_H is None else max(TILE_H, min_compile_h)
@@ -886,7 +852,7 @@ class MoeTokenPermuteGrad:
 
 def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
     print(f"\n{'=' * 65}")
-    print(f"开始测试 MoeTokenPermuteGrad, 数据类型: {tl_dtype_str.upper()}")
+    print(f"Testing MoeTokenPermuteGrad, dtype: {tl_dtype_str.upper()}")
     print(f"{'=' * 65}")
 
     torch.manual_seed(42)
@@ -898,7 +864,7 @@ def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
 
     all_passed = True
 
-    print(">>> 测试用例 1: 标准 Backward 梯度对齐测试")
+    print(">>> Test case 1: Standard Backward gradient alignment test")
 
     tokens = torch.randn(
         num_tokens, hidden_size, dtype=pt_dtype, device="npu", requires_grad=True
@@ -928,12 +894,17 @@ def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
 
     try:
         torch.testing.assert_close(tl_input_grad, npu_input_grad)
-        print(f"    [PASS] {tl_dtype_str.upper()} 标准 Backward 精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} Standard Backward precision test passed!"
+        )
     except AssertionError as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} 标准 Backward 精度测试失败！\n", e)
+        print(
+            f"    [FAILED] {tl_dtype_str.upper()} Standard Backward precision test failed!\n",
+            e,
+        )
         all_passed = False
 
-    print("\n>>> 测试用例 2: 带截断的 Clip Backward 梯度对齐测试")
+    print("\n>>> Test case 2: Clip Backward gradient alignment test with truncation")
     num_out_tokens = 10
 
     tokens_clip = torch.randn(
@@ -964,10 +935,12 @@ def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
 
     try:
         torch.testing.assert_close(tl_input_grad_clip, npu_input_grad_clip)
-        print(f"    [PASS] {tl_dtype_str.upper()} Clip 截断 Backward 精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} Clip truncation Backward precision test passed!"
+        )
     except AssertionError as e:
         print(
-            f"    [FAILED] {tl_dtype_str.upper()} Clip 截断 Backward 精度测试失败！\n",
+            f"    [FAILED] {tl_dtype_str.upper()} Clip truncation Backward precision test failed!\n",
             e,
         )
         all_passed = False

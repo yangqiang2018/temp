@@ -227,11 +227,6 @@ def _build_grad_kernel_with_probs(
     tokens_per_core = int(math.ceil(num_tokens / actual_cores))
     HALF_H = TILE_H // 2
 
-    # Uniform "lanes per batched iteration" pick — same shape as the rest of
-    # the moe_token_*_grad kernels. For topK in {1,2,4,8} this matches the
-    # previous 8/4/2-tiered dispatch exactly; for topK in {3,5,6,7} it picks
-    # B=topK so the entire topK is a single batched MTE2+emit instead of
-    # B=4 + sequential remainder, which is strictly more parallel.
     B = min(8, topK)
     n_groups = topK // B
     remainder = topK % B
@@ -667,7 +662,7 @@ class MoeTokenUnpermuteGrad:
 
 def test_unpermute_grad_parameterized(pt_dtype, tl_dtype_str):
     print(f"\n{'=' * 65}")
-    print(f"开始测试 MoeTokenUnpermuteGrad, 数据类型: {tl_dtype_str.upper()}")
+    print(f"Testing MoeTokenUnpermuteGrad, dtype: {tl_dtype_str.upper()}")
     print(f"{'=' * 65}")
 
     torch.manual_seed(42)
@@ -731,35 +726,37 @@ def test_unpermute_grad_parameterized(pt_dtype, tl_dtype_str):
         probs=probs.detach(),
     )
 
-    print(f"\n>>> 验证 permuted_tokens_grad (形状: [{E}, {hidden_size}])")
+    print(f"\n>>> Verifying permuted_tokens_grad (shape: [{E}, {hidden_size}])")
     print(
         f"    ref shape: {ref_permuted_tokens_grad.shape}, tl shape: {tl_permuted_tokens_grad.shape}"
     )
 
     try:
         torch.testing.assert_close(tl_permuted_tokens_grad, ref_permuted_tokens_grad)
-        print(f"    [PASS] {tl_dtype_str.upper()} permuted_tokens_grad 精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} permuted_tokens_grad precision test passed!"
+        )
     except Exception as e:
         print(
-            f"    [FAILED] {tl_dtype_str.upper()} permuted_tokens_grad 精度测试失败！"
+            f"    [FAILED] {tl_dtype_str.upper()} permuted_tokens_grad precision test failed!"
         )
         max_diff = (
             (tl_permuted_tokens_grad - ref_permuted_tokens_grad).abs().max().item()
         )
-        print(f"    最大绝对误差: {max_diff}")
+        print(f"    Max absolute error: {max_diff}")
         print(e)
         all_passed = False
 
-    print(f"\n>>> 验证 probs_grad (形状: [{num_tokens}, {topk}])")
+    print(f"\n>>> Verifying probs_grad (shape: [{num_tokens}, {topk}])")
     print(f"    ref shape: {ref_probs_grad.shape}, tl shape: {tl_probs_grad.shape}")
 
     try:
         torch.testing.assert_close(tl_probs_grad, ref_probs_grad)
-        print(f"    [PASS] {tl_dtype_str.upper()} probs_grad 精度测试通过！")
+        print(f"    [PASS] {tl_dtype_str.upper()} probs_grad precision test passed!")
     except Exception as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} probs_grad 精度测试失败！")
+        print(f"    [FAILED] {tl_dtype_str.upper()} probs_grad precision test failed!")
         max_diff = (tl_probs_grad - ref_probs_grad).abs().max().item()
-        print(f"    最大绝对误差: {max_diff}")
+        print(f"    Max absolute error: {max_diff}")
         print(e)
         all_passed = False
 
@@ -801,7 +798,7 @@ def test_unpermute_grad_parameterized(pt_dtype, tl_dtype_str):
     )
 
     print(
-        f"\n>>> 验证 permuted_tokens_grad (形状: ref {ref_permuted_tokens_grad_np.shape}, tl {tl_permuted_tokens_grad_np.shape})"
+        f"\n>>> Verifying permuted_tokens_grad (shape: ref {ref_permuted_tokens_grad_np.shape}, tl {tl_permuted_tokens_grad_np.shape})"
     )
 
     try:
@@ -809,11 +806,11 @@ def test_unpermute_grad_parameterized(pt_dtype, tl_dtype_str):
             tl_permuted_tokens_grad_np, ref_permuted_tokens_grad_np
         )
         print(
-            f"    [PASS] {tl_dtype_str.upper()} no-probs permuted_tokens_grad 精度测试通过！"
+            f"    [PASS] {tl_dtype_str.upper()} no-probs permuted_tokens_grad precision test passed!"
         )
     except Exception as e:
         print(
-            f"    [FAILED] {tl_dtype_str.upper()} no-probs permuted_tokens_grad 精度测试失败！"
+            f"    [FAILED] {tl_dtype_str.upper()} no-probs permuted_tokens_grad precision test failed!"
         )
         max_diff = (
             (tl_permuted_tokens_grad_np - ref_permuted_tokens_grad_np)
@@ -821,7 +818,7 @@ def test_unpermute_grad_parameterized(pt_dtype, tl_dtype_str):
             .max()
             .item()
         )
-        print(f"    最大绝对误差: {max_diff}")
+        print(f"    Max absolute error: {max_diff}")
         print(f"    ref:\n{ref_permuted_tokens_grad_np}")
         print(f"    tl:\n{tl_permuted_tokens_grad_np}")
         print(e)

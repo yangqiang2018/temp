@@ -82,15 +82,6 @@ def _build_fused_permute_kernel(
             indices_gm: T.Tensor([1, padded_E], idx_dtype),
             perm_out_gm: T.Tensor([out_len, hidden_size], dtype),
             sio_out_gm: T.Tensor([1, padded_E], idx_dtype),
-            # workspace_gm is flattened to 1D so the cross-core histogram
-            # exchange `T.copy(workspace_gm[0, 0], ws_ub)` is a single-row
-            # contiguous read into ws_ub [1, ws_total]. With the 2D shape
-            # [actual_cores, num_experts] this read crossed row boundaries —
-            # same multi-row → flat-buf mismatch that broke the unpermute
-            # with-probs path (issue #6). It also explained issue #7: bad
-            # ws_ub corrupts the per-expert offsets, so every sio entry and
-            # every perm_out write lands at the wrong row, hence the 80–100%
-            # element mismatch.
             workspace_gm: T.Tensor([1, ws_total], idx_dtype),
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
@@ -299,14 +290,7 @@ class MoeTokenPermute:
         self.num_experts = num_experts
         self.E = num_tokens * topK
         self._out_len = num_out_tokens if num_out_tokens > 0 else self.E
-        # The kernel's row_buf is shape [stages, HALF_H] with HALF_H = TILE_H//2,
-        # and the pipelined loop accesses row_buf[1, :] which lives at byte
-        # offset HALF_H * dtype_bytes. The NPU vector unit requires 32B aligned
-        # addresses, so HALF_H * dtype_bytes must be >= 32. With TILE_H defaulting
-        # to hidden_size, that means hidden_size * dtype_bytes >= 64. Pad the
-        # compile-time hidden up to that bound when the user's hidden is smaller;
-        # input is padded with zeros and output is sliced back at __call__ time
-        # (same approach MoeTokenUnpermute already uses).
+
         min_compile_h = 64 if _is_fp32(dtype) else 32
         self._compile_hidden_size = max(hidden_size, min_compile_h)
         compile_tile_h = TILE_H if TILE_H is None else max(TILE_H, min_compile_h)
@@ -337,7 +321,7 @@ class MoeTokenPermute:
 
 def test_permute_parameterized(pt_dtype, tl_dtype_str):
     print(f"\n{'=' * 60}")
-    print(f"开始测试 MoeTokenPermute, 数据类型: {tl_dtype_str.upper()}")
+    print(f"Testing MoeTokenPermute, dtype: {tl_dtype_str.upper()}")
     print(f"{'=' * 60}")
 
     torch.manual_seed(42)
@@ -349,7 +333,7 @@ def test_permute_parameterized(pt_dtype, tl_dtype_str):
 
     all_passed = True
 
-    print(">>> 测试用例 1: 标准 Forward 测试")
+    print(">>> Test case 1: Standard Forward test")
 
     tokens = torch.randn(num_tokens, hidden_size, dtype=pt_dtype, device="npu")
     indices = torch.randint(
@@ -370,12 +354,17 @@ def test_permute_parameterized(pt_dtype, tl_dtype_str):
     try:
         torch.testing.assert_close(tl_permuted, npu_permuted)
         torch.testing.assert_close(tl_sorted_idx, npu_sorted_idx)
-        print(f"    [PASS] {tl_dtype_str.upper()} 标准 Forward 精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} Standard Forward precision test passed!"
+        )
     except AssertionError as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} 标准 Forward 精度测试失败！\n", e)
+        print(
+            f"    [FAILED] {tl_dtype_str.upper()} Standard Forward precision test failed!\n",
+            e,
+        )
         all_passed = False
 
-    print("\n>>> 测试用例 2: 带截断的 Clip 测试")
+    print("\n>>> Test case 2: Clip test with truncation")
     num_out_tokens = 10
 
     tokens_clip = torch.randn(num_tokens, hidden_size, dtype=pt_dtype, device="npu")
@@ -402,9 +391,14 @@ def test_permute_parameterized(pt_dtype, tl_dtype_str):
     try:
         torch.testing.assert_close(tl_permuted_clip, npu_permuted_clip)
         torch.testing.assert_close(tl_sorted_idx_clip, npu_sorted_idx_clip)
-        print(f"    [PASS] {tl_dtype_str.upper()} Clip 截断精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} Clip truncation precision test passed!"
+        )
     except AssertionError as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} Clip 截断精度测试失败！\n", e)
+        print(
+            f"    [FAILED] {tl_dtype_str.upper()} Clip truncation precision test failed!\n",
+            e,
+        )
         all_passed = False
 
     return all_passed

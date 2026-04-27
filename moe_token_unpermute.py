@@ -132,16 +132,6 @@ def _build_gather_kernel_with_probs(
         BATCH_T -= 1
     n_batches = int(math.ceil(tokens_per_core / BATCH_T))
 
-    # Same lanes-per-iter unification used by moe_token_permute_grad: a single
-    # batched MTE2+axpy of LANES_PER_ITER=min(8,topK) lanes, repeated n_iters
-    # times, with `rem = topK % LANES_PER_ITER` for the tail. This replaces a
-    # `if topK == 8: 8-way; else: init+4-quads+remainder` dispatch — for
-    # topK=8 the IR is identical, for topK in {3,5,6,7} every lane lands in a
-    # single batched group instead of B=4+sequential-remainder, and topK
-    # in {1,2,4} stays effectively the same (one extra T.tile.fill replacing
-    # the explicit cast+mul init step). MoeTokenUnpermute's min_compile_h
-    # floor (32 for fp16/bf16, 64 for fp32) keeps HALF_H * dtype_bytes >= 32B,
-    # so row_buf[lane, :] is naturally aligned even when LANES_PER_ITER < 8.
     LANES_PER_ITER = min(8, topK)
     n_iters = topK // LANES_PER_ITER
     rem = topK % LANES_PER_ITER
@@ -181,12 +171,6 @@ def _build_gather_kernel_with_probs(
         def moe_token_unpermute(
             perm_tokens_gm: T.Tensor([E, hidden_size], dtype),
             sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
-            # probs_gm is the per-token-per-lane probs flattened to 1D, mirroring
-            # sorted_idx_gm's layout. Originally declared as [padded_tokens, topK]
-            # with `T.copy(probs_gm[batch_base, 0], probs_ub)` reading
-            # BATCH_T*topK elements across rows — that multi-row read was the
-            # source of issue #6's 87.5% mismatch. Flattening makes the copy
-            # unambiguously linear and matches sorted_idx_gm's pattern.
             probs_gm: T.Tensor([1, padded_tokens * topK], dtype),
             out_gm: T.Tensor([num_tokens, hidden_size], dtype),
         ):
@@ -338,7 +322,6 @@ def _build_gather_kernel_with_probs_f32(
         def moe_token_unpermute(
             perm_tokens_gm: T.Tensor([E, hidden_size], dtype),
             sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
-            # See the cast-path kernel for why probs_gm is flattened to 1D.
             probs_gm: T.Tensor([1, padded_tokens * topK], dtype),
             out_gm: T.Tensor([num_tokens, hidden_size], dtype),
         ):
@@ -542,7 +525,7 @@ def _compile_gather(
     if min_tile_h > TILE_H:
         TILE_H = min(hidden_size, min_tile_h)
     assert hidden_size % TILE_H == 0, (
-        f"hidden_size ({hidden_size}) 必须是 TILE_H ({TILE_H}) 的整数倍！"
+        f"hidden_size ({hidden_size}) must be a multiple of TILE_H ({TILE_H})!"
     )
     assert HAS_TILELANG, "tilelang is required"
     assert topK <= 512, "topK ≤ 512 (Atlas A2/A3)"
@@ -676,11 +659,9 @@ class MoeTokenUnpermute:
         permuted_tokens_in = pad_last_dim(permuted_tokens, self._compile_hidden_size)
 
         if self.has_probs:
-            assert probs is not None, "has_probs=True 但未传入 probs"
+            assert probs is not None, "has_probs=True but probs is not provided"
             probs_padded = pad_first_dim(probs, self._padded_tokens)
-            # Kernel expects probs flattened to [1, padded_tokens * topK] (see
-            # the kernel signature comment). reshape(-1) on a [padded_tokens,
-            # topK] contiguous tensor is the row-major flatten the copy expects.
+
             probs_flat = probs_padded.contiguous().reshape(1, -1)
             out = self._kernel(permuted_tokens_in, indices_padded_2d, probs_flat)
             return out[:, : self.hidden_size].contiguous()
@@ -694,13 +675,15 @@ class MoeTokenUnpermute:
 
 def test_unpermute_parameterized(pt_dtype, tl_dtype_str):
     print(f"\n{'=' * 65}")
-    print(f"开始测试 MoeTokenUnpermute, 数据类型: {tl_dtype_str.upper()}")
+    print(f"Testing MoeTokenUnpermute, dtype: {tl_dtype_str.upper()}")
     print(f"{'=' * 65}")
 
     torch.manual_seed(42)
     all_passed = True
 
-    print(">>> 测试用例 1: 无 probs 正向对齐测试 (N=16, H=8, K=4) → 输出 [64, 8]")
+    print(
+        ">>> Test case 1: Forward alignment test without probs (N=16, H=8, K=4) -> output [64, 8]"
+    )
 
     num_tokens = 16
     hidden_size = 8
@@ -730,15 +713,21 @@ def test_unpermute_parameterized(pt_dtype, tl_dtype_str):
 
     try:
         torch.testing.assert_close(tl_tokens, npu_tokens)
-        print(f"    [PASS] {tl_dtype_str.upper()} 无 probs 正向精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} Forward without probs precision test passed!"
+        )
     except AssertionError as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} 无 probs 正向精度测试失败！")
+        print(
+            f"    [FAILED] {tl_dtype_str.upper()} Forward without probs precision test failed!"
+        )
         max_diff = (tl_tokens - npu_tokens).abs().max().item()
-        print(f"    最大绝对误差: {max_diff}")
+        print(f"    Max absolute error: {max_diff}")
         print(e)
         all_passed = False
 
-    print("\n>>> 测试用例 2: 带 probs 加权正向对齐测试 (N=8, H=4, K=2) → 输出 [8, 4]")
+    print(
+        "\n>>> Test case 2: Weighted forward alignment test with probs (N=8, H=4, K=2) -> output [8, 4]"
+    )
 
     torch.manual_seed(42)
 
@@ -775,15 +764,21 @@ def test_unpermute_parameterized(pt_dtype, tl_dtype_str):
 
     try:
         torch.testing.assert_close(tl_tokens_2, npu_tokens_2)
-        print(f"    [PASS] {tl_dtype_str.upper()} 带 probs 加权精度测试通过！")
+        print(
+            f"    [PASS] {tl_dtype_str.upper()} Weighted with-probs precision test passed!"
+        )
     except AssertionError as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} 带 probs 加权精度测试失败！")
+        print(
+            f"    [FAILED] {tl_dtype_str.upper()} Weighted with-probs precision test failed!"
+        )
         max_diff = (tl_tokens_2 - npu_tokens_2).abs().max().item()
-        print(f"    最大绝对误差: {max_diff}")
+        print(f"    Max absolute error: {max_diff}")
         print(e)
         all_passed = False
 
-    print("\n>>> 测试用例 3: permute → unpermute 往返一致性测试 (N=16, H=8, K=4)")
+    print(
+        "\n>>> Test case 3: permute -> unpermute round-trip consistency test (N=16, H=8, K=4)"
+    )
 
     torch.manual_seed(42)
 
@@ -819,14 +814,14 @@ def test_unpermute_parameterized(pt_dtype, tl_dtype_str):
     try:
         torch.testing.assert_close(tl_reconstruct_3, npu_reconstruct_3)
         print(
-            f"    [PASS] {tl_dtype_str.upper()} permute→unpermute 往返一致性测试通过！"
+            f"    [PASS] {tl_dtype_str.upper()} permute -> unpermute round-trip consistency test passed!"
         )
     except AssertionError as e:
         print(
-            f"    [FAILED] {tl_dtype_str.upper()} permute→unpermute 往返一致性测试失败！"
+            f"    [FAILED] {tl_dtype_str.upper()} permute -> unpermute round-trip consistency test failed!"
         )
         max_diff = (tl_reconstruct_3 - npu_reconstruct_3).abs().max().item()
-        print(f"    最大绝对误差: {max_diff}")
+        print(f"    Max absolute error: {max_diff}")
         print(e)
         all_passed = False
 
