@@ -81,7 +81,7 @@ def _build_fused_permute_kernel(
                 cpre_ub = T.alloc_ub([1], idx_dtype)
                 running_ub = T.alloc_ub([1], idx_dtype)
                 wp_ub = T.alloc_ub([1], idx_dtype)
-                row_buf = T.alloc_ub([stages, 1, HALF_H], dtype)
+                row_buf = T.alloc_ub([stages, HALF_H], dtype)
 
                 my_start = cid * chunk_size
 
@@ -143,7 +143,7 @@ def _build_fused_permute_kernel(
                         pro_h_off = 0 + vid * HALF_H
                         T.wait_flag("mte3", "mte2", 0)
                         if pro_src < num_tokens:
-                            T.copy(tokens_gm[pro_src, pro_h_off], row_buf[0, :, :])
+                            T.copy(tokens_gm[pro_src, pro_h_off], row_buf[0, :])
                         T.set_flag("mte2", "v", 0)
                         T.set_flag("mte2", "mte3", 10)
 
@@ -168,7 +168,7 @@ def _build_fused_permute_kernel(
                         if has_next:
                             T.wait_flag("mte3", "mte2", nxt)
                             if next_src < num_tokens:
-                                T.copy(tokens_gm[next_src, next_h_off], row_buf[nxt, :, :])
+                                T.copy(tokens_gm[next_src, next_h_off], row_buf[nxt, :])
                             T.set_flag("mte2", "v", nxt)
                             T.set_flag("mte2", "mte3", nxt + 10)
 
@@ -179,7 +179,10 @@ def _build_fused_permute_kernel(
                             for k in T.serial(topK):
                                 wp_ub[0] = sio_chunk_ub[0, cur_base + k]
                                 if wp_ub[0] < out_len:
-                                    T.copy(row_buf[cur, :, :], perm_out_gm[wp_ub[0], cur_h_off])
+                                    T.copy(
+                                        row_buf[cur, :],
+                                        perm_out_gm[wp_ub[0], cur_h_off],
+                                    )
 
                         T.set_flag("v", "mte3", cur)
                         T.wait_flag("v", "mte3", cur)
@@ -311,7 +314,9 @@ def test_permute_parameterized(pt_dtype, tl_dtype_str):
     print(">>> 测试用例 1: 标准 Forward 测试")
 
     tokens = torch.randn(num_tokens, hidden_size, dtype=pt_dtype, device="npu")
-    indices = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
+    indices = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu"
+    )
 
     npu_permuted, npu_sorted_idx = torch_npu.npu_moe_token_permute(tokens, indices)
 
@@ -336,9 +341,13 @@ def test_permute_parameterized(pt_dtype, tl_dtype_str):
     num_out_tokens = 10
 
     tokens_clip = torch.randn(num_tokens, hidden_size, dtype=pt_dtype, device="npu")
-    indices_clip = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
+    indices_clip = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu"
+    )
 
-    npu_permuted_clip, npu_sorted_idx_clip = torch_npu.npu_moe_token_permute(tokens_clip, indices_clip, num_out_tokens=num_out_tokens)
+    npu_permuted_clip, npu_sorted_idx_clip = torch_npu.npu_moe_token_permute(
+        tokens_clip, indices_clip, num_out_tokens=num_out_tokens
+    )
 
     tl_op_clip = MoeTokenPermute(
         num_tokens=num_tokens,
@@ -348,7 +357,9 @@ def test_permute_parameterized(pt_dtype, tl_dtype_str):
         num_out_tokens=num_out_tokens,
         dtype=tl_dtype_str,
     )
-    tl_permuted_clip, tl_sorted_idx_clip = tl_op_clip(tokens_clip, indices_clip.view(-1))
+    tl_permuted_clip, tl_sorted_idx_clip = tl_op_clip(
+        tokens_clip, indices_clip.view(-1)
+    )
 
     try:
         torch.testing.assert_close(tl_permuted_clip, npu_permuted_clip)

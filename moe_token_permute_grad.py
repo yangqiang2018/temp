@@ -432,21 +432,37 @@ def _build_gather_reduce_kernel_cast(
                                         T.copy(perm_grad_gm[src6, h_off], row_buf6)
                                         T.copy(perm_grad_gm[src7, h_off], row_buf7)
                                         T.barrier_all()
-                                        T.tile.cast(row_f32, row_buf0, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf0, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf1, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf1, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf2, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf2, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf3, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf3, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf4, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf4, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf5, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf5, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf6, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf6, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
-                                        T.tile.cast(row_f32, row_buf7, CAST_LOW2HIGH, HALF_H)
+                                        T.tile.cast(
+                                            row_f32, row_buf7, CAST_LOW2HIGH, HALF_H
+                                        )
                                         T.tile.add(acc_buf, acc_buf, row_f32)
 
                                     if remainder > 0:
@@ -455,7 +471,9 @@ def _build_gather_reduce_kernel_cast(
                                             src = idx_ub[0, tk_off + base + r]
                                             T.copy(perm_grad_gm[src, h_off], row_buf0)
                                             T.barrier_all()
-                                            T.tile.cast(row_f32, row_buf0, CAST_LOW2HIGH, HALF_H)
+                                            T.tile.cast(
+                                                row_f32, row_buf0, CAST_LOW2HIGH, HALF_H
+                                            )
                                             T.tile.add(acc_buf, acc_buf, row_f32)
 
                                     T.barrier_all()
@@ -607,17 +625,33 @@ def _compile_gather_reduce(
     align_elems = ALIGN_BYTES // dtype_bytes
 
     if TILE_H is None:
-        for candidate in [hidden_size, 4096 // dtype_bytes, 2048 // dtype_bytes, 1024, 512, align_elems]:
-            if candidate > 0 and candidate >= align_elems and hidden_size % candidate == 0:
+        for candidate in [
+            hidden_size,
+            4096 // dtype_bytes,
+            2048 // dtype_bytes,
+            1024,
+            512,
+            align_elems,
+        ]:
+            if (
+                candidate > 0
+                and candidate >= align_elems
+                and hidden_size % candidate == 0
+            ):
                 TILE_H = candidate
                 break
         else:
             TILE_H = align_elems
 
-    assert TILE_H * dtype_bytes >= ALIGN_BYTES and (TILE_H * dtype_bytes) % ALIGN_BYTES == 0, (
+    assert (
+        TILE_H * dtype_bytes >= ALIGN_BYTES
+        and (TILE_H * dtype_bytes) % ALIGN_BYTES == 0
+    ), (
         f"TILE_H={TILE_H} * sizeof({dtype})={dtype_bytes} = {TILE_H * dtype_bytes}B; must be >= 32B and a multiple of 32B"
     )
-    assert hidden_size % TILE_H == 0, f"hidden_size ({hidden_size}) must be divisible by TILE_H ({TILE_H})"
+    assert hidden_size % TILE_H == 0, (
+        f"hidden_size ({hidden_size}) must be divisible by TILE_H ({TILE_H})"
+    )
 
     n_htiles = int(hidden_size // TILE_H)
 
@@ -627,13 +661,11 @@ def _compile_gather_reduce(
     padded_E = int(actual_cores * tokens_per_core * topK)
 
     HALF_H_candidate = hidden_size // 2 if hidden_size % 2 == 0 else 0
-    half_h_aligned = (
-        HALF_H_candidate > 0 and HALF_H_candidate * dtype_bytes >= ALIGN_BYTES and (HALF_H_candidate * dtype_bytes) % ALIGN_BYTES == 0
-    )
 
-    use_group_pipelined = dtype != CAL_DTYPE and topK == 8 and hidden_size == TILE_H and half_h_aligned
-
-    use_lane_pipelined = not use_group_pipelined and dtype != CAL_DTYPE and topK <= 8 and hidden_size == TILE_H and half_h_aligned
+    # 临时禁用 pipelined 优化路径，因为新版 tilelang codegen 不再支持 3D buffer 切片访问
+    # 走 fallback 路径（_build_gather_reduce_kernel_cast / _nocast）功能等价但无流水线优化
+    use_group_pipelined = False
+    use_lane_pipelined = False
 
     if use_group_pipelined:
         HALF_H = HALF_H_candidate
@@ -783,7 +815,9 @@ class MoeTokenPermuteGrad:
                     device=device,
                 )
             perm_grad_padded = self._perm_grad_pad_buf
-            perm_grad_padded[: permuted_output_grad.shape[0]].copy_(permuted_output_grad)
+            perm_grad_padded[: permuted_output_grad.shape[0]].copy_(
+                permuted_output_grad
+            )
         else:
             perm_grad_padded = permuted_output_grad
 
@@ -820,8 +854,12 @@ def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
 
     print(">>> 测试用例 1: 标准 Backward 梯度对齐测试")
 
-    tokens = torch.randn(num_tokens, hidden_size, dtype=pt_dtype, device="npu", requires_grad=True)
-    indices = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
+    tokens = torch.randn(
+        num_tokens, hidden_size, dtype=pt_dtype, device="npu", requires_grad=True
+    )
+    indices = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu"
+    )
 
     npu_permuted, npu_sorted_idx = torch_npu.npu_moe_token_permute(tokens, indices)
 
@@ -852,10 +890,16 @@ def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
     print("\n>>> 测试用例 2: 带截断的 Clip Backward 梯度对齐测试")
     num_out_tokens = 10
 
-    tokens_clip = torch.randn(num_tokens, hidden_size, dtype=pt_dtype, device="npu", requires_grad=True)
-    indices_clip = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
+    tokens_clip = torch.randn(
+        num_tokens, hidden_size, dtype=pt_dtype, device="npu", requires_grad=True
+    )
+    indices_clip = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu"
+    )
 
-    npu_permuted_clip, npu_sorted_idx_clip = torch_npu.npu_moe_token_permute(tokens_clip, indices_clip, num_out_tokens=num_out_tokens)
+    npu_permuted_clip, npu_sorted_idx_clip = torch_npu.npu_moe_token_permute(
+        tokens_clip, indices_clip, num_out_tokens=num_out_tokens
+    )
 
     grad_permuted_clip = torch.randn_like(npu_permuted_clip)
     npu_permuted_clip.backward(grad_permuted_clip)
@@ -876,7 +920,10 @@ def test_permute_grad_parameterized(pt_dtype, tl_dtype_str):
         torch.testing.assert_close(tl_input_grad_clip, npu_input_grad_clip)
         print(f"    [PASS] {tl_dtype_str.upper()} Clip 截断 Backward 精度测试通过！")
     except AssertionError as e:
-        print(f"    [FAILED] {tl_dtype_str.upper()} Clip 截断 Backward 精度测试失败！\n", e)
+        print(
+            f"    [FAILED] {tl_dtype_str.upper()} Clip 截断 Backward 精度测试失败！\n",
+            e,
+        )
         all_passed = False
 
     return all_passed
@@ -891,7 +938,9 @@ def test_permute_grad():
 
     overall_passed = True
     for pt_type, tl_type_str in dtypes_to_test:
-        passed = test_permute_grad_parameterized(pt_dtype=pt_type, tl_dtype_str=tl_type_str)
+        passed = test_permute_grad_parameterized(
+            pt_dtype=pt_type, tl_dtype_str=tl_type_str
+        )
         if not passed:
             overall_passed = False
 
