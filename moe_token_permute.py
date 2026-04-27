@@ -10,6 +10,20 @@ PASS_CONFIGS_EXPERT = {
 }
 
 
+def _is_fp32(dtype: str) -> bool:
+    return dtype in ("float32", "float")
+
+
+def _pad_last_dim(tensor: torch.Tensor, target_cols: int) -> torch.Tensor:
+    if tensor.shape[-1] >= target_cols:
+        return tensor
+    out = torch.zeros(
+        (*tensor.shape[:-1], target_cols), dtype=tensor.dtype, device=tensor.device
+    )
+    out[..., : tensor.shape[-1]] = tensor
+    return out
+
+
 def _build_fused_permute_kernel(
     num_tokens,
     topK,
@@ -272,28 +286,43 @@ class MoeTokenPermute:
     ):
         self.num_tokens = num_tokens
         self.topK = topK
+        self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.E = num_tokens * topK
         self._out_len = num_out_tokens if num_out_tokens > 0 else self.E
+        # The kernel's row_buf is shape [stages, HALF_H] with HALF_H = TILE_H//2,
+        # and the pipelined loop accesses row_buf[1, :] which lives at byte
+        # offset HALF_H * dtype_bytes. The NPU vector unit requires 32B aligned
+        # addresses, so HALF_H * dtype_bytes must be >= 32. With TILE_H defaulting
+        # to hidden_size, that means hidden_size * dtype_bytes >= 64. Pad the
+        # compile-time hidden up to that bound when the user's hidden is smaller;
+        # input is padded with zeros and output is sliced back at __call__ time
+        # (same approach MoeTokenUnpermute already uses).
+        min_compile_h = 64 if _is_fp32(dtype) else 32
+        self._compile_hidden_size = max(hidden_size, min_compile_h)
+        compile_tile_h = TILE_H if TILE_H is None else max(TILE_H, min_compile_h)
         self._fused_func, self._padded_E = _compile_fused(
             num_tokens,
             topK,
-            hidden_size,
+            self._compile_hidden_size,
             self.E,
             self._out_len,
             num_experts,
             NUM_CORES=NUM_CORES,
-            TILE_H=TILE_H,
+            TILE_H=compile_tile_h,
             dtype=dtype,
         )
 
     def __call__(self, tokens, indices):
         device = tokens.device
         E = self.E
+        tokens_in = _pad_last_dim(tokens, self._compile_hidden_size)
         indices_padded = torch.zeros(self._padded_E, dtype=torch.int32, device=device)
         indices_padded[:E] = indices
-        perm_out, sio_padded = self._fused_func(tokens, indices_padded.unsqueeze(0))
+        perm_out, sio_padded = self._fused_func(tokens_in, indices_padded.unsqueeze(0))
         sio = sio_padded.squeeze(0)[:E]
+        if self._compile_hidden_size != self.hidden_size:
+            perm_out = perm_out[:, : self.hidden_size].contiguous()
         return perm_out, sio
 
 

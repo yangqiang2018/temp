@@ -164,7 +164,13 @@ def _build_gather_kernel_with_probs(
         def moe_token_unpermute(
             perm_tokens_gm: T.Tensor([E, hidden_size], dtype),
             sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
-            probs_gm: T.Tensor([padded_tokens, topK], dtype),
+            # probs_gm is the per-token-per-lane probs flattened to 1D, mirroring
+            # sorted_idx_gm's layout. Originally declared as [padded_tokens, topK]
+            # with `T.copy(probs_gm[batch_base, 0], probs_ub)` reading
+            # BATCH_T*topK elements across rows — that multi-row read was the
+            # source of issue #6's 87.5% mismatch. Flattening makes the copy
+            # unambiguously linear and matches sorted_idx_gm's pattern.
+            probs_gm: T.Tensor([1, padded_tokens * topK], dtype),
             out_gm: T.Tensor([num_tokens, hidden_size], dtype),
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
@@ -182,7 +188,7 @@ def _build_gather_kernel_with_probs(
                         batch_base = cid * tokens_per_core + batch_id * BATCH_T
 
                         T.copy(sorted_idx_gm[0, batch_base * topK], idx_ub)
-                        T.copy(probs_gm[batch_base, 0], probs_ub)
+                        T.copy(probs_gm[0, batch_base * topK], probs_ub)
                         T.barrier_all()
                         T.tile.cast(probs_f32, probs_ub, CAST_LOW2HIGH, BATCH_T * topK)
 
@@ -348,7 +354,8 @@ def _build_gather_kernel_with_probs_f32(
         def moe_token_unpermute(
             perm_tokens_gm: T.Tensor([E, hidden_size], dtype),
             sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
-            probs_gm: T.Tensor([padded_tokens, topK], dtype),
+            # See the cast-path kernel for why probs_gm is flattened to 1D.
+            probs_gm: T.Tensor([1, padded_tokens * topK], dtype),
             out_gm: T.Tensor([num_tokens, hidden_size], dtype),
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
@@ -361,7 +368,7 @@ def _build_gather_kernel_with_probs_f32(
                     batch_base = cid * tokens_per_core + batch_id * BATCH_T
 
                     T.copy(sorted_idx_gm[0, batch_base * topK], idx_ub)
-                    T.copy(probs_gm[batch_base, 0], probs_ub)
+                    T.copy(probs_gm[0, batch_base * topK], probs_ub)
 
                     for ti in T.serial(BATCH_T):
                         i = batch_base + ti
@@ -687,7 +694,11 @@ class MoeTokenUnpermute:
         if self.has_probs:
             assert probs is not None, "has_probs=True 但未传入 probs"
             probs_padded = pad_first_dim(probs, self._padded_tokens)
-            out = self._kernel(permuted_tokens_in, indices_padded_2d, probs_padded)
+            # Kernel expects probs flattened to [1, padded_tokens * topK] (see
+            # the kernel signature comment). reshape(-1) on a [padded_tokens,
+            # topK] contiguous tensor is the row-major flatten the copy expects.
+            probs_flat = probs_padded.contiguous().reshape(1, -1)
+            out = self._kernel(permuted_tokens_in, indices_padded_2d, probs_flat)
             return out[:, : self.hidden_size].contiguous()
 
         out = self._kernel(permuted_tokens_in, indices_padded_2d)
