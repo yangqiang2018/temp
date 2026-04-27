@@ -83,7 +83,10 @@ def _build_gather_reduce_kernel_cast_group_pipelined(
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                row_buf = T.alloc_ub([stages, topK, HALF_H], dtype)
+                # row_buf was [stages, topK, HALF_H]; flattened to 2D as
+                # [stages * topK, HALF_H] to satisfy the codegen's
+                # "no 3D slicing" rule. Indexed as row_buf[stage * topK + lane, :].
+                row_buf = T.alloc_ub([stages * topK, HALF_H], dtype)
                 row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
                 acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
@@ -109,7 +112,7 @@ def _build_gather_reduce_kernel_cast_group_pipelined(
                                 src_p = idx_ub[0, lane]
                                 T.copy(
                                     perm_grad_gm[src_p, h_off],
-                                    row_buf[0, lane, :],
+                                    row_buf[lane, :],
                                 )
                             T.set_flag("mte2", "v", 0)
 
@@ -125,7 +128,7 @@ def _build_gather_reduce_kernel_cast_group_pipelined(
                                     src_n = idx_ub[0, nxt_tk_off + lane]
                                     T.copy(
                                         perm_grad_gm[src_n, h_off],
-                                        row_buf[nxt_stage, lane, :],
+                                        row_buf[nxt_stage * topK + lane, :],
                                     )
                                 T.set_flag("mte2", "v", nxt_stage)
 
@@ -134,7 +137,7 @@ def _build_gather_reduce_kernel_cast_group_pipelined(
                             T.tile.fill(acc_buf, 0.0)
 
                             for lane in T.serial(topK):
-                                T.copy(row_buf[cur_stage, lane, :], row_tmp)
+                                T.copy(row_buf[cur_stage * topK + lane, :], row_tmp)
                                 T.tile.cast(row_f32, row_tmp, CAST_LOW2HIGH, HALF_H)
                                 T.tile.add(acc_buf, acc_buf, row_f32)
 
@@ -222,7 +225,10 @@ def _build_gather_reduce_kernel_cast_pipelined(
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                row_buf = T.alloc_ub([stages, 1, HALF_H], dtype)
+                # row_buf was [stages, 1, HALF_H]; flattened to 2D to satisfy
+                # the codegen's "no 3D slicing" rule (the middle dim was
+                # always 1 anyway).
+                row_buf = T.alloc_ub([stages, HALF_H], dtype)
                 row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
                 acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
@@ -251,37 +257,37 @@ def _build_gather_reduce_kernel_cast_pipelined(
                         if total_iters_per_batch > 0:
                             T.wait_flag("v", "mte2", 0)
                             src_p0 = idx_ub[0, 0]
-                            T.copy(perm_grad_gm[src_p0, h_off], row_buf[0, :, :])
+                            T.copy(perm_grad_gm[src_p0, h_off], row_buf[0, :])
                             T.set_flag("mte2", "v", 0)
                         if total_iters_per_batch > 1:
                             T.wait_flag("v", "mte2", 1)
                             src_p1 = idx_ub[0, 1]
-                            T.copy(perm_grad_gm[src_p1, h_off], row_buf[1, :, :])
+                            T.copy(perm_grad_gm[src_p1, h_off], row_buf[1, :])
                             T.set_flag("mte2", "v", 1)
                         if total_iters_per_batch > 2:
                             T.wait_flag("v", "mte2", 2)
                             src_p2 = idx_ub[0, 2]
-                            T.copy(perm_grad_gm[src_p2, h_off], row_buf[2, :, :])
+                            T.copy(perm_grad_gm[src_p2, h_off], row_buf[2, :])
                             T.set_flag("mte2", "v", 2)
                         if total_iters_per_batch > 3:
                             T.wait_flag("v", "mte2", 3)
                             src_p3 = idx_ub[0, 3]
-                            T.copy(perm_grad_gm[src_p3, h_off], row_buf[3, :, :])
+                            T.copy(perm_grad_gm[src_p3, h_off], row_buf[3, :])
                             T.set_flag("mte2", "v", 3)
                         if total_iters_per_batch > 4:
                             T.wait_flag("v", "mte2", 4)
                             src_p4 = idx_ub[0, 4]
-                            T.copy(perm_grad_gm[src_p4, h_off], row_buf[4, :, :])
+                            T.copy(perm_grad_gm[src_p4, h_off], row_buf[4, :])
                             T.set_flag("mte2", "v", 4)
                         if total_iters_per_batch > 5:
                             T.wait_flag("v", "mte2", 5)
                             src_p5 = idx_ub[0, 5]
-                            T.copy(perm_grad_gm[src_p5, h_off], row_buf[5, :, :])
+                            T.copy(perm_grad_gm[src_p5, h_off], row_buf[5, :])
                             T.set_flag("mte2", "v", 5)
                         if total_iters_per_batch > 6:
                             T.wait_flag("v", "mte2", 6)
                             src_p6 = idx_ub[0, 6]
-                            T.copy(perm_grad_gm[src_p6, h_off], row_buf[6, :, :])
+                            T.copy(perm_grad_gm[src_p6, h_off], row_buf[6, :])
                             T.set_flag("mte2", "v", 6)
 
                         for it in T.serial(total_iters_per_batch):
@@ -298,7 +304,7 @@ def _build_gather_reduce_kernel_cast_pipelined(
                                 src_n = idx_ub[0, next_it]
                                 T.copy(
                                     perm_grad_gm[src_n, h_off],
-                                    row_buf[next_stage, :, :],
+                                    row_buf[next_stage, :],
                                 )
                                 T.set_flag("mte2", "v", next_stage)
 
@@ -307,7 +313,7 @@ def _build_gather_reduce_kernel_cast_pipelined(
                             if cur_lane == 0:
                                 T.tile.fill(acc_buf, 0.0)
 
-                            T.copy(row_buf[cur_stage, :, :], row_tmp)
+                            T.copy(row_buf[cur_stage, :], row_tmp)
                             T.tile.cast(row_f32, row_tmp, CAST_LOW2HIGH, HALF_H)
                             T.tile.add(acc_buf, acc_buf, row_f32)
 
@@ -663,10 +669,28 @@ def _compile_gather_reduce(
 
     HALF_H_candidate = hidden_size // 2 if hidden_size % 2 == 0 else 0
 
-    # 临时禁用 pipelined 优化路径，因为新版 tilelang codegen 不再支持 3D buffer 切片访问
-    # 走 fallback 路径（_build_gather_reduce_kernel_cast / _nocast）功能等价但无流水线优化
-    use_group_pipelined = False
-    use_lane_pipelined = False
+    # Pipelined kernels run on the V-half-split layout (HALF_H = TILE_H/2 per
+    # vector core) and were previously disabled because their row_buf used a
+    # 3D shape that the new codegen rejects. Both have now been flattened to
+    # 2D — lane-pipelined: [stages, HALF_H]; group-pipelined: [stages*topK,
+    # HALF_H] — so we can re-enable them whenever:
+    #   - cast path (fp16/bf16); fp32 has its own non-cast path
+    #   - single h-tile (hidden_size == TILE_H)
+    #   - HALF_H is well-defined and meets NPU 32B alignment + V-op width
+    # group_pipelined is the topK==8 specialization that double-buffers the
+    # whole 8-lane batch; lane_pipelined is the 8-stage prefetch that handles
+    # any topK <= 8.
+    is_cast_path = dtype != CAL_DTYPE
+    single_htile = hidden_size == TILE_H
+    half_aligned = (
+        HALF_H_candidate > 0
+        and HALF_H_candidate * 2 == TILE_H
+        and HALF_H_candidate * dtype_bytes >= ALIGN_BYTES
+    )
+    pipelined_eligible = is_cast_path and single_htile and half_aligned
+
+    use_group_pipelined = pipelined_eligible and topK == 8
+    use_lane_pipelined = pipelined_eligible and topK <= 8 and not use_group_pipelined
 
     if use_group_pipelined:
         HALF_H = HALF_H_candidate
