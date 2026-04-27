@@ -357,7 +357,19 @@ def _build_gather_reduce_kernel_cast(
 ):
     assert topK >= 1, "cast kernel requires topK >= 1"
     HALF_H = TILE_H // 2
-    LANES_PER_ITER = min(8, topK)
+    # row_buf is shape [LANES_PER_ITER, HALF_H]; row 1 onwards start at byte
+    # offset (HALF_H * dtype_bytes). NPU vector ops require 32B alignment, so
+    # when the per-row stride is below 32B (e.g. fp16 + small hidden where
+    # HALF_H*2 = 16B), strided access into row >= 1 raises ADDR_MISALIGN at
+    # runtime. Fall back to a single row in that case — the kernel then runs
+    # `n_iters = topK` sequential lane iterations against `row_buf[0, :]`,
+    # which has an aligned base address.
+    dtype_bytes = 4 if dtype in ("float32", "float") else 2
+    ALIGN_BYTES = 32
+    if HALF_H * dtype_bytes >= ALIGN_BYTES:
+        LANES_PER_ITER = min(8, topK)
+    else:
+        LANES_PER_ITER = 1
     n_iters = topK // LANES_PER_ITER
     rem = topK % LANES_PER_ITER
 
