@@ -132,6 +132,20 @@ def _build_gather_kernel_with_probs(
         BATCH_T -= 1
     n_batches = int(math.ceil(tokens_per_core / BATCH_T))
 
+    # Same lanes-per-iter unification used by moe_token_permute_grad: a single
+    # batched MTE2+axpy of LANES_PER_ITER=min(8,topK) lanes, repeated n_iters
+    # times, with `rem = topK % LANES_PER_ITER` for the tail. This replaces a
+    # `if topK == 8: 8-way; else: init+4-quads+remainder` dispatch — for
+    # topK=8 the IR is identical, for topK in {3,5,6,7} every lane lands in a
+    # single batched group instead of B=4+sequential-remainder, and topK
+    # in {1,2,4} stays effectively the same (one extra T.tile.fill replacing
+    # the explicit cast+mul init step). MoeTokenUnpermute's min_compile_h
+    # floor (32 for fp16/bf16, 64 for fp32) keeps HALF_H * dtype_bytes >= 32B,
+    # so row_buf[lane, :] is naturally aligned even when LANES_PER_ITER < 8.
+    LANES_PER_ITER = min(8, topK)
+    n_iters = topK // LANES_PER_ITER
+    rem = topK % LANES_PER_ITER
+
     @tilelang.jit(out_idx=[3], pass_configs=PASS_CONFIGS_EXPERT)
     def _build(
         num_tokens,
@@ -153,6 +167,9 @@ def _build_gather_kernel_with_probs(
         HALF_H,
         BATCH_T,
         n_batches,
+        LANES_PER_ITER,
+        n_iters,
+        rem,
     ):
         @T.macro
         def cast_axpy(slot, prob, row_buf, row_tmp, row_f32, acc_buf):
@@ -177,7 +194,7 @@ def _build_gather_kernel_with_probs(
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
                 probs_ub = T.alloc_ub([1, BATCH_T * topK], dtype)
                 probs_f32 = T.alloc_ub([1, BATCH_T * topK], acc_dtype)
-                row_buf = T.alloc_ub([8, HALF_H], dtype)
+                row_buf = T.alloc_ub([LANES_PER_ITER, HALF_H], dtype)
                 row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], acc_dtype)
                 acc_buf = T.alloc_ub([1, HALF_H], acc_dtype)
@@ -199,17 +216,19 @@ def _build_gather_kernel_with_probs(
                                     h_off = ht * TILE_H + vid * HALF_H
                                     tk_off = ti * topK
 
-                                    if topK == 8:
-                                        T.tile.fill(acc_buf, 0.0)
-                                        for lane in T.serial(8):
-                                            src = idx_ub[0, tk_off + lane]
+                                    T.tile.fill(acc_buf, 0.0)
+
+                                    for jj in T.serial(n_iters):
+                                        base = jj * LANES_PER_ITER
+                                        for lane in T.serial(LANES_PER_ITER):
+                                            src = idx_ub[0, tk_off + base + lane]
                                             T.copy(
                                                 perm_tokens_gm[src, h_off],
                                                 row_buf[lane, :],
                                             )
                                         T.barrier_all()
-                                        for lane in T.serial(8):
-                                            prob = probs_f32[0, tk_off + lane]
+                                        for lane in T.serial(LANES_PER_ITER):
+                                            prob = probs_f32[0, tk_off + base + lane]
                                             cast_axpy(
                                                 lane,
                                                 prob,
@@ -218,58 +237,20 @@ def _build_gather_kernel_with_probs(
                                                 row_f32,
                                                 acc_buf,
                                             )
-                                    else:
-                                        src_row_0 = idx_ub[0, tk_off]
-                                        prob_val_0 = probs_f32[0, tk_off]
-                                        T.copy(
-                                            perm_tokens_gm[src_row_0, h_off],
-                                            row_buf[0, :],
-                                        )
-                                        T.barrier_all()
-                                        T.copy(row_buf[0, :], row_tmp)
-                                        T.tile.cast(
-                                            acc_buf, row_tmp, CAST_LOW2HIGH, HALF_H
-                                        )
-                                        T.tile.mul(acc_buf, acc_buf, prob_val_0)
 
-                                        n_quads = (topK - 1) // 4
-                                        remainder = (topK - 1) % 4
-
-                                        for j4 in T.serial(n_quads):
-                                            j = j4 * 4
-                                            for lane in T.serial(4):
-                                                src = idx_ub[0, tk_off + j + lane + 1]
-                                                T.copy(
-                                                    perm_tokens_gm[src, h_off],
-                                                    row_buf[lane, :],
-                                                )
-                                            T.barrier_all()
-                                            for lane in T.serial(4):
-                                                prob = probs_f32[
-                                                    0, tk_off + j + lane + 1
-                                                ]
-                                                cast_axpy(
-                                                    lane,
-                                                    prob,
-                                                    row_buf,
-                                                    row_tmp,
-                                                    row_f32,
-                                                    acc_buf,
-                                                )
-
-                                        for r in T.serial(remainder):
-                                            off = n_quads * 4 + r + 1
-                                            src = idx_ub[0, tk_off + off]
+                                    if rem > 0:
+                                        base = n_iters * LANES_PER_ITER
+                                        for lane in T.serial(rem):
+                                            src = idx_ub[0, tk_off + base + lane]
                                             T.copy(
                                                 perm_tokens_gm[src, h_off],
-                                                row_buf[r, :],
+                                                row_buf[lane, :],
                                             )
                                         T.barrier_all()
-                                        for r in T.serial(remainder):
-                                            off = n_quads * 4 + r + 1
-                                            prob = probs_f32[0, tk_off + off]
+                                        for lane in T.serial(rem):
+                                            prob = probs_f32[0, tk_off + base + lane]
                                             cast_axpy(
-                                                r,
+                                                lane,
                                                 prob,
                                                 row_buf,
                                                 row_tmp,
@@ -305,6 +286,9 @@ def _build_gather_kernel_with_probs(
         HALF_H,
         BATCH_T,
         n_batches,
+        LANES_PER_ITER,
+        n_iters,
+        rem,
     )
 
 
