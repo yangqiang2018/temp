@@ -22,6 +22,20 @@ CAST_LOW2HIGH = "CAST_NONE"
 CAST_HIGH2LOW = "CAST_RINT"
 
 
+def _is_fp32(dtype: str) -> bool:
+    return dtype in ("float32", "float")
+
+
+def _pad_last_dim(tensor: torch.Tensor, target_cols: int) -> torch.Tensor:
+    if tensor.shape[-1] >= target_cols:
+        return tensor
+    out = torch.zeros(
+        (*tensor.shape[:-1], target_cols), dtype=tensor.dtype, device=tensor.device
+    )
+    out[..., : tensor.shape[-1]] = tensor
+    return out
+
+
 def _build_gather_reduce_kernel_cast_group_pipelined(
     num_tokens,
     topK,
@@ -763,13 +777,26 @@ class MoeTokenPermuteGrad:
         self.E = num_tokens * topK
         self._out_len = num_out_tokens if num_out_tokens > 0 else self.E
 
+        # Match the min_compile_h floor used by MoeTokenPermute /
+        # MoeTokenUnpermute / MoeTokenUnpermuteGrad. The cast kernel runs
+        # T.tile.cast / T.tile.add over HALF_H-element tiles, and the NPU
+        # vector unit rejects sub-32B tile widths with "VEC supports illegal
+        # configurations in commands" (see issue #8 — hidden=16 fp16 ⇒
+        # HALF_H=8 ⇒ 16B-wide V-op trip). Enforcing HALF_H * dtype_bytes ≥
+        # 32B at compile time eliminates both that V-op width problem and
+        # the strided-row alignment problem that the LANES_PER_ITER=1
+        # fallback was patching around.
+        min_compile_h = 64 if _is_fp32(dtype) else 32
+        self._compile_hidden_size = max(hidden_size, min_compile_h)
+        compile_tile_h = TILE_H if TILE_H is None else max(TILE_H, min_compile_h)
+
         self._kernel, self._padded_E = _compile_gather_reduce(
             num_tokens,
             topK,
-            hidden_size,
+            self._compile_hidden_size,
             self.E,
             NUM_CORES=NUM_CORES,
-            TILE_H=TILE_H,
+            TILE_H=compile_tile_h,
             dtype=dtype,
         )
 
@@ -788,23 +815,28 @@ class MoeTokenPermuteGrad:
     def __call__(self, permuted_output_grad, sorted_indices):
         device = permuted_output_grad.device
         E = self.E
+        H = self._compile_hidden_size
 
-        if permuted_output_grad.shape[0] < E:
+        needs_pad = (
+            permuted_output_grad.shape[0] < E or permuted_output_grad.shape[1] < H
+        )
+        if needs_pad:
+            target_shape = (E, H)
             if (
                 self._perm_grad_pad_buf is None
                 or self._perm_grad_pad_buf.device != device
                 or self._perm_grad_pad_buf.dtype != permuted_output_grad.dtype
+                or tuple(self._perm_grad_pad_buf.shape) != target_shape
             ):
                 self._perm_grad_pad_buf = torch.zeros(
-                    E,
-                    self.hidden_size,
+                    *target_shape,
                     dtype=permuted_output_grad.dtype,
                     device=device,
                 )
             perm_grad_padded = self._perm_grad_pad_buf
-            perm_grad_padded[: permuted_output_grad.shape[0]].copy_(
-                permuted_output_grad
-            )
+            r = permuted_output_grad.shape[0]
+            c = permuted_output_grad.shape[1]
+            perm_grad_padded[:r, :c].copy_(permuted_output_grad)
         else:
             perm_grad_padded = permuted_output_grad
 
@@ -818,6 +850,9 @@ class MoeTokenPermuteGrad:
             perm_grad_padded,
             sorted_idx_padded.unsqueeze(0),
         )
+
+        if H != self.hidden_size:
+            input_grad = input_grad[:, : self.hidden_size].contiguous()
 
         return input_grad
 
