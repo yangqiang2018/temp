@@ -82,7 +82,16 @@ def _build_fused_permute_kernel(
             indices_gm: T.Tensor([1, padded_E], idx_dtype),
             perm_out_gm: T.Tensor([out_len, hidden_size], dtype),
             sio_out_gm: T.Tensor([1, padded_E], idx_dtype),
-            workspace_gm: T.Tensor([actual_cores, num_experts], idx_dtype),
+            # workspace_gm is flattened to 1D so the cross-core histogram
+            # exchange `T.copy(workspace_gm[0, 0], ws_ub)` is a single-row
+            # contiguous read into ws_ub [1, ws_total]. With the 2D shape
+            # [actual_cores, num_experts] this read crossed row boundaries —
+            # same multi-row → flat-buf mismatch that broke the unpermute
+            # with-probs path (issue #6). It also explained issue #7: bad
+            # ws_ub corrupts the per-expert offsets, so every sio entry and
+            # every perm_out write lands at the wrong row, hence the 80–100%
+            # element mismatch.
+            workspace_gm: T.Tensor([1, ws_total], idx_dtype),
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, chunk_size], idx_dtype)
@@ -118,7 +127,7 @@ def _build_fused_permute_kernel(
                     T.set_flag("v", "mte3", 2)
                     T.wait_flag("v", "mte3", 2)
 
-                    T.copy(hist_ub, workspace_gm[cid, 0])
+                    T.copy(hist_ub, workspace_gm[0, cid * num_experts])
 
                     T.set_flag("mte3", "mte2", 2)
                     T.wait_flag("mte3", "mte2", 2)
