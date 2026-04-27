@@ -355,16 +355,12 @@ def _build_gather_reduce_kernel_cast(
     dtype,
     idx_dtype,
 ):
+    assert topK >= 1, "cast kernel requires topK >= 1"
     HALF_H = TILE_H // 2
-    n_octs = topK // 8
-    remainder = topK % 8
+    LANES_PER_ITER = min(8, topK)
+    n_iters = topK // LANES_PER_ITER
+    rem = topK % LANES_PER_ITER
 
-    # Two specialized prim_funcs are defined at Python scope and selected
-    # before @T.prim_func runs. We tried `if n_octs > 0:` *inside* a single
-    # prim_func, but tilelang lifts those into TIR If nodes whose branches
-    # have their own variable scope — so a buffer allocated in one branch
-    # is "Undefined" inside another sibling branch elsewhere in the body.
-    # Specializing at Python level sidesteps the TIR scoping entirely.
     @tilelang.jit(out_idx=[2], pass_configs=PASS_CONFIGS_EXPERT)
     def _build(
         num_tokens,
@@ -381,170 +377,86 @@ def _build_gather_reduce_kernel_cast(
         n_batches,
         dtype,
         idx_dtype,
-        n_octs,
-        remainder,
+        LANES_PER_ITER,
+        n_iters,
+        rem,
     ):
-        if n_octs > 0:
+        @T.prim_func
+        def moe_token_permute_grad(
+            perm_grad_gm: T.Tensor([E, hidden_size], dtype),
+            sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
+            input_grad_gm: T.Tensor([num_tokens, hidden_size], dtype),
+        ):
+            with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
+                idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
+                # Allocate exactly LANES_PER_ITER row buffers — every one of
+                # them is unconditionally referenced inside the n_iters loop
+                # body below (n_iters >= 1 since LANES_PER_ITER <= topK), so
+                # memory planning won't prune any of them.
+                row_bufs = [
+                    T.alloc_ub([1, HALF_H], dtype) for _ in range(LANES_PER_ITER)
+                ]
+                row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
+                acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
+                out_buf = T.alloc_ub([1, HALF_H], dtype)
 
-            @T.prim_func
-            def moe_token_permute_grad(
-                perm_grad_gm: T.Tensor([E, hidden_size], dtype),
-                sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
-                input_grad_gm: T.Tensor([num_tokens, hidden_size], dtype),
-            ):
-                with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
-                    idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                    row_buf0 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf1 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf2 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf3 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf4 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf5 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf6 = T.alloc_ub([1, HALF_H], dtype)
-                    row_buf7 = T.alloc_ub([1, HALF_H], dtype)
-                    row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
-                    acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
-                    out_buf = T.alloc_ub([1, HALF_H], dtype)
+                with T.Scope("V"):
+                    for batch_id in T.serial(n_batches):
+                        batch_base = cid * tokens_per_core + batch_id * BATCH_T
 
-                    with T.Scope("V"):
-                        for batch_id in T.serial(n_batches):
-                            batch_base = cid * tokens_per_core + batch_id * BATCH_T
+                        T.copy(sorted_idx_gm[0, batch_base * topK], idx_ub)
+                        T.barrier_all()
 
-                            T.copy(sorted_idx_gm[0, batch_base * topK], idx_ub)
-                            T.barrier_all()
+                        for ti in T.serial(BATCH_T):
+                            i = batch_base + ti
+                            if i < num_tokens:
+                                for ht in T.serial(n_htiles):
+                                    h_off = ht * TILE_H + vid * HALF_H
+                                    tk_off = ti * topK
 
-                            for ti in T.serial(BATCH_T):
-                                i = batch_base + ti
-                                if i < num_tokens:
-                                    for ht in T.serial(n_htiles):
-                                        h_off = ht * TILE_H + vid * HALF_H
-                                        tk_off = ti * topK
+                                    T.tile.fill(acc_buf, 0.0)
 
-                                        T.tile.fill(acc_buf, 0.0)
-
-                                        for j8 in T.serial(n_octs):
-                                            j = j8 * 8
-                                            src0 = idx_ub[0, tk_off + j]
-                                            src1 = idx_ub[0, tk_off + j + 1]
-                                            src2 = idx_ub[0, tk_off + j + 2]
-                                            src3 = idx_ub[0, tk_off + j + 3]
-                                            src4 = idx_ub[0, tk_off + j + 4]
-                                            src5 = idx_ub[0, tk_off + j + 5]
-                                            src6 = idx_ub[0, tk_off + j + 6]
-                                            src7 = idx_ub[0, tk_off + j + 7]
-                                            T.copy(perm_grad_gm[src0, h_off], row_buf0)
-                                            T.copy(perm_grad_gm[src1, h_off], row_buf1)
-                                            T.copy(perm_grad_gm[src2, h_off], row_buf2)
-                                            T.copy(perm_grad_gm[src3, h_off], row_buf3)
-                                            T.copy(perm_grad_gm[src4, h_off], row_buf4)
-                                            T.copy(perm_grad_gm[src5, h_off], row_buf5)
-                                            T.copy(perm_grad_gm[src6, h_off], row_buf6)
-                                            T.copy(perm_grad_gm[src7, h_off], row_buf7)
-                                            T.barrier_all()
-                                            T.tile.cast(
-                                                row_f32, row_buf0, CAST_LOW2HIGH, HALF_H
+                                    for jj in T.serial(n_iters):
+                                        base = jj * LANES_PER_ITER
+                                        for lane in range(LANES_PER_ITER):
+                                            src = idx_ub[0, tk_off + base + lane]
+                                            T.copy(
+                                                perm_grad_gm[src, h_off],
+                                                row_bufs[lane],
                                             )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf1, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf2, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf3, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf4, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf5, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf6, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-                                            T.tile.cast(
-                                                row_f32, row_buf7, CAST_LOW2HIGH, HALF_H
-                                            )
-                                            T.tile.add(acc_buf, acc_buf, row_f32)
-
-                                        if remainder > 0:
-                                            base = n_octs * 8
-                                            for r in T.serial(remainder):
-                                                src = idx_ub[0, tk_off + base + r]
-                                                T.copy(
-                                                    perm_grad_gm[src, h_off], row_buf0
-                                                )
-                                                T.barrier_all()
-                                                T.tile.cast(
-                                                    row_f32,
-                                                    row_buf0,
-                                                    CAST_LOW2HIGH,
-                                                    HALF_H,
-                                                )
-                                                T.tile.add(acc_buf, acc_buf, row_f32)
-
                                         T.barrier_all()
-                                        T.tile.cast(
-                                            out_buf, acc_buf, CAST_HIGH2LOW, HALF_H
-                                        )
-                                        T.pipe_barrier("v")
-                                        T.copy(out_buf, input_grad_gm[i, h_off])
-                                        T.pipe_barrier("mte3")
-
-        else:
-
-            @T.prim_func
-            def moe_token_permute_grad(
-                perm_grad_gm: T.Tensor([E, hidden_size], dtype),
-                sorted_idx_gm: T.Tensor([1, padded_E], idx_dtype),
-                input_grad_gm: T.Tensor([num_tokens, hidden_size], dtype),
-            ):
-                with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
-                    idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                    row_buf0 = T.alloc_ub([1, HALF_H], dtype)
-                    row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
-                    acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
-                    out_buf = T.alloc_ub([1, HALF_H], dtype)
-
-                    with T.Scope("V"):
-                        for batch_id in T.serial(n_batches):
-                            batch_base = cid * tokens_per_core + batch_id * BATCH_T
-
-                            T.copy(sorted_idx_gm[0, batch_base * topK], idx_ub)
-                            T.barrier_all()
-
-                            for ti in T.serial(BATCH_T):
-                                i = batch_base + ti
-                                if i < num_tokens:
-                                    for ht in T.serial(n_htiles):
-                                        h_off = ht * TILE_H + vid * HALF_H
-                                        tk_off = ti * topK
-
-                                        T.tile.fill(acc_buf, 0.0)
-
-                                        for r in T.serial(remainder):
-                                            src = idx_ub[0, tk_off + r]
-                                            T.copy(perm_grad_gm[src, h_off], row_buf0)
-                                            T.barrier_all()
+                                        for lane in range(LANES_PER_ITER):
                                             T.tile.cast(
-                                                row_f32, row_buf0, CAST_LOW2HIGH, HALF_H
+                                                row_f32,
+                                                row_bufs[lane],
+                                                CAST_LOW2HIGH,
+                                                HALF_H,
                                             )
                                             T.tile.add(acc_buf, acc_buf, row_f32)
 
+                                    if rem > 0:
+                                        base = n_iters * LANES_PER_ITER
+                                        for lane in range(rem):
+                                            src = idx_ub[0, tk_off + base + lane]
+                                            T.copy(
+                                                perm_grad_gm[src, h_off],
+                                                row_bufs[lane],
+                                            )
                                         T.barrier_all()
-                                        T.tile.cast(
-                                            out_buf, acc_buf, CAST_HIGH2LOW, HALF_H
-                                        )
-                                        T.pipe_barrier("v")
-                                        T.copy(out_buf, input_grad_gm[i, h_off])
-                                        T.pipe_barrier("mte3")
+                                        for lane in range(rem):
+                                            T.tile.cast(
+                                                row_f32,
+                                                row_bufs[lane],
+                                                CAST_LOW2HIGH,
+                                                HALF_H,
+                                            )
+                                            T.tile.add(acc_buf, acc_buf, row_f32)
+
+                                    T.barrier_all()
+                                    T.tile.cast(out_buf, acc_buf, CAST_HIGH2LOW, HALF_H)
+                                    T.pipe_barrier("v")
+                                    T.copy(out_buf, input_grad_gm[i, h_off])
+                                    T.pipe_barrier("mte3")
 
         return moe_token_permute_grad
 
@@ -563,8 +475,9 @@ def _build_gather_reduce_kernel_cast(
         n_batches,
         dtype,
         idx_dtype,
-        n_octs,
-        remainder,
+        LANES_PER_ITER,
+        n_iters,
+        rem,
     )
 
 
