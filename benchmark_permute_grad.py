@@ -6,19 +6,13 @@ import warnings
 warnings.filterwarnings("ignore", message="Cannot create tensor with interal format")
 
 
-def benchmark_moe_permute_grad(
-    num_tokens, hidden_size, topk, num_experts, warmup=10, iters=100
-):
+def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmup=10, iters=100):
     """
     针对指定的规格对 MoeTokenPermuteGrad 和 torch_npu 原生反向算子进行 Benchmark。
     """
     # 1. 初始化张量与前向计算 (开启 requires_grad 以追踪计算图)
-    tokens = torch.randn(
-        num_tokens, hidden_size, dtype=torch.float16, device="npu", requires_grad=True
-    )
-    indices = torch.randint(
-        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu"
-    )
+    tokens = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device="npu", requires_grad=True)
+    indices = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
 
     # 运行官方前向算子，获取反向所需的 sorted_indices 和前向输出
     npu_permuted, sorted_indices = torch_npu.npu_moe_token_permute(tokens, indices)
@@ -124,8 +118,5 @@ if __name__ == "__main__":
             )
 
         except Exception as e:
-            print(
-                f"{desc:<30} | {num_tokens:<6} | {hidden_size:<6} | {topk:<4} | {num_experts:<7} | "
-                f"{'FAILED':<13} | {'FAILED':<10} | N/A"
-            )
+            print(f"{desc:<30} | {num_tokens:<6} | {hidden_size:<6} | {topk:<4} | {num_experts:<7} | {'FAILED':<13} | {'FAILED':<10} | N/A")
             print(f"  -> Error: {e}")
