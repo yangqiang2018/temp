@@ -389,13 +389,13 @@ def _build_gather_reduce_kernel_cast(
         ):
             with T.Kernel(actual_cores, is_npu=True) as (cid, vid):
                 idx_ub = T.alloc_ub([1, BATCH_T * topK], idx_dtype)
-                # Allocate exactly LANES_PER_ITER row buffers — every one of
-                # them is unconditionally referenced inside the n_iters loop
-                # body below (n_iters >= 1 since LANES_PER_ITER <= topK), so
-                # memory planning won't prune any of them.
-                row_bufs = [
-                    T.alloc_ub([1, HALF_H], dtype) for _ in range(LANES_PER_ITER)
-                ]
+                # Single 2D row_buf indexed by lane — same pattern as the
+                # unpermute kernel. Sized exactly to LANES_PER_ITER so every
+                # lane is referenced by the n_iters loop below; memory
+                # planning won't prune the buffer. row_tmp is the [1, HALF_H]
+                # flat copy target since T.tile.cast doesn't accept 2D slices.
+                row_buf = T.alloc_ub([LANES_PER_ITER, HALF_H], dtype)
+                row_tmp = T.alloc_ub([1, HALF_H], dtype)
                 row_f32 = T.alloc_ub([1, HALF_H], CAL_DTYPE)
                 acc_buf = T.alloc_ub([1, HALF_H], CAL_DTYPE)
                 out_buf = T.alloc_ub([1, HALF_H], dtype)
@@ -418,37 +418,33 @@ def _build_gather_reduce_kernel_cast(
 
                                     for jj in T.serial(n_iters):
                                         base = jj * LANES_PER_ITER
-                                        for lane in range(LANES_PER_ITER):
+                                        for lane in T.serial(LANES_PER_ITER):
                                             src = idx_ub[0, tk_off + base + lane]
                                             T.copy(
                                                 perm_grad_gm[src, h_off],
-                                                row_bufs[lane],
+                                                row_buf[lane, :],
                                             )
                                         T.barrier_all()
-                                        for lane in range(LANES_PER_ITER):
+                                        for lane in T.serial(LANES_PER_ITER):
+                                            T.copy(row_buf[lane, :], row_tmp)
                                             T.tile.cast(
-                                                row_f32,
-                                                row_bufs[lane],
-                                                CAST_LOW2HIGH,
-                                                HALF_H,
+                                                row_f32, row_tmp, CAST_LOW2HIGH, HALF_H
                                             )
                                             T.tile.add(acc_buf, acc_buf, row_f32)
 
                                     if rem > 0:
                                         base = n_iters * LANES_PER_ITER
-                                        for lane in range(rem):
+                                        for lane in T.serial(rem):
                                             src = idx_ub[0, tk_off + base + lane]
                                             T.copy(
                                                 perm_grad_gm[src, h_off],
-                                                row_bufs[lane],
+                                                row_buf[lane, :],
                                             )
                                         T.barrier_all()
-                                        for lane in range(rem):
+                                        for lane in T.serial(rem):
+                                            T.copy(row_buf[lane, :], row_tmp)
                                             T.tile.cast(
-                                                row_f32,
-                                                row_bufs[lane],
-                                                CAST_LOW2HIGH,
-                                                HALF_H,
+                                                row_f32, row_tmp, CAST_LOW2HIGH, HALF_H
                                             )
                                             T.tile.add(acc_buf, acc_buf, row_f32)
 
