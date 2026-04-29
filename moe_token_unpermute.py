@@ -573,7 +573,7 @@ class MoeTokenUnpermute:
         dtype: str = "float16",
     ):
         if padded_mode:
-            raise NotImplementedError("paddedMode=True not supported.")
+            raise NotImplementedError("padded_mode=True not supported.")
         assert topK <= 512
         assert dtype in ("float16", "bfloat16", "float32", "float"), f"dtype must be float16/bfloat16/float32, got {dtype}"
 

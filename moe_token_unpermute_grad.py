@@ -488,7 +488,7 @@ def _compile_grad(
     min_tile_h = 64 if is_fp32_dtype(dtype) else 8
     if min_tile_h > TILE_H:
         TILE_H = min(hidden_size, min_tile_h)
-    assert hidden_size % TILE_H == 0
+    assert hidden_size % TILE_H == 0, f"hidden_size ({hidden_size}) must be a multiple of TILE_H ({TILE_H})!"
     assert HAS_TILELANG
     assert topK <= 512
 
@@ -583,7 +583,7 @@ class MoeTokenUnpermuteGrad:
         unperm_grad_in = pad_last_dim(unpermuted_tokens_grad, self._compile_hidden_size)
 
         if self.has_probs:
-            assert probs is not None
+            assert probs is not None, "has_probs=True but probs is not provided"
             probs_padded = pad_first_dim(probs, self._padded_tokens)
             perm_grad, probs_grad_raw = self._kernel(permuted_tokens_in, unperm_grad_in, indices_padded_2d, probs_padded)
             perm_grad = perm_grad[:, : self.hidden_size].contiguous()
