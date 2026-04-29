@@ -2,7 +2,7 @@ import math
 import torch
 import torch_npu
 
-from utils import auto_tile_h, auto_tile_t, is_fp32_dtype, pad_first_dim, pad_last_dim
+from moe_token_utils import auto_tile_h, auto_tile_t, is_fp32_dtype, pad_first_dim, pad_last_dim
 
 try:
     import tilelang
