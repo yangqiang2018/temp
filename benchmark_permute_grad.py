@@ -7,9 +7,6 @@ warnings.filterwarnings("ignore", message="Cannot create tensor with interal for
 
 
 def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmup=10, iters=100):
-    """
-    针对指定的规格对 MoeTokenPermuteGrad 和 torch_npu 原生反向算子进行 Benchmark。
-    """
     tokens = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device="npu", requires_grad=True)
     indices = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
 
