@@ -471,7 +471,7 @@ def _compile_gather(
     acc_dtype: str = "float32",
 ):
     if TILE_H is None:
-        TILE_H = auto_tile_h(hidden_size, dtype)
+        TILE_H = auto_tile_h(hidden_size)
     if TILE_T is None:
         total = num_tokens if has_probs else int(num_tokens * topK)
         large_candidates = [64, 32, 16, 8, 4, 2, 1] if has_probs else [128, 64, 32, 16, 8, 4, 2, 1]

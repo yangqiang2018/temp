@@ -483,7 +483,7 @@ def _compile_grad(
     acc_dtype: str = "float32",
 ):
     if TILE_H is None:
-        TILE_H = auto_tile_h(hidden_size, dtype)
+        TILE_H = auto_tile_h(hidden_size)
     if TILE_T is None:
         total = num_tokens if has_probs else int(num_tokens * topK)
         TILE_T = auto_tile_t(total, NUM_CORES)

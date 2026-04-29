@@ -5,13 +5,8 @@ def is_fp32_dtype(dtype: str) -> bool:
     return dtype in ("float32", "float")
 
 
-def auto_tile_h(hidden_size: int, dtype: str) -> int:
-    dtype_scale = 2 if is_fp32_dtype(dtype) else 1
-    max_tile_h = 4096 // dtype_scale
-    for candidate in [hidden_size, max_tile_h, 2048 // dtype_scale, 1024, 512, 256]:
-        if candidate > 0 and hidden_size % candidate == 0:
-            return candidate
-    return 256
+def auto_tile_h(hidden_size: int) -> int:
+    return hidden_size
 
 
 def auto_tile_t(total: int, num_cores: int, large_candidates=None) -> int:
@@ -49,10 +44,8 @@ if __name__ == "__main__":
     assert is_fp32_dtype("float32") and is_fp32_dtype("float")
     assert not is_fp32_dtype("float16") and not is_fp32_dtype("bfloat16")
 
-    assert auto_tile_h(7168, "float16") == 7168
-    assert auto_tile_h(8192, "float16") == 8192
-    assert auto_tile_h(8192, "float32") == 8192
-    assert auto_tile_h(384, "float16") == 384
+    assert auto_tile_h(7168) == 7168
+    assert auto_tile_h(384) == 384
 
     assert auto_tile_t(8192, 24) == 64
     assert auto_tile_t(16, 24) == 16
