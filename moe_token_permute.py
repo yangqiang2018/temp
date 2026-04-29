@@ -7,6 +7,7 @@ import torch_npu
 PASS_CONFIGS_EXPERT = {
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
 
 
@@ -97,118 +98,116 @@ def _build_fused_permute_kernel(
 
                 my_start = cid * chunk_size
 
-                with T.Scope("C"):
-                    T.sync_all()
+                T.sync_all()
 
-                with T.Scope("V"):
-                    for e in T.Pipelined(num_experts):
-                        hist_ub[0, e] = 0
+                for e in T.Pipelined(num_experts):
+                    hist_ub[0, e] = 0
 
-                    T.copy(indices_gm[0, my_start], idx_ub)
-                    T.set_flag("mte2", "v", 2)
-                    T.wait_flag("mte2", "v", 2)
+                T.copy(indices_gm[0, my_start], idx_ub)
+                T.set_flag("mte2", "v", 2)
+                T.wait_flag("mte2", "v", 2)
 
-                    for i in T.Pipelined(chunk_size):
-                        if my_start + i < E:
-                            expert = idx_ub[0, i]
-                            hist_ub[0, expert] = hist_ub[0, expert] + 1
+                for i in T.Pipelined(chunk_size):
+                    if my_start + i < E:
+                        expert = idx_ub[0, i]
+                        hist_ub[0, expert] = hist_ub[0, expert] + 1
 
-                    T.set_flag("v", "mte3", 2)
-                    T.wait_flag("v", "mte3", 2)
+                T.set_flag("v", "mte3", 2)
+                T.wait_flag("v", "mte3", 2)
 
-                    T.copy(hist_ub, workspace_gm[0, cid * num_experts])
+                T.copy(hist_ub, workspace_gm[0, cid * num_experts])
 
-                    T.set_flag("mte3", "mte2", 2)
-                    T.wait_flag("mte3", "mte2", 2)
-                    T.sync_all()
+                T.set_flag("mte3", "mte2", 2)
+                T.wait_flag("mte3", "mte2", 2)
+                T.sync_all()
 
-                    T.copy(workspace_gm[0, 0], ws_ub)
-                    T.set_flag("mte2", "v", 3)
-                    T.wait_flag("mte2", "v", 3)
+                T.copy(workspace_gm[0, 0], ws_ub)
+                T.set_flag("mte2", "v", 3)
+                T.wait_flag("mte2", "v", 3)
 
-                    running_ub[0] = 0
-                    for e in T.Pipelined(num_experts):
-                        acc_ub[0] = 0
-                        cpre_ub[0] = 0
-                        for c in T.Pipelined(actual_cores):
-                            acc_ub[0] = acc_ub[0] + ws_ub[0, c * num_experts + e]
-                            if c < cid:
-                                cpre_ub[0] = cpre_ub[0] + ws_ub[0, c * num_experts + e]
-                        offsets_ub[0, e] = running_ub[0] + cpre_ub[0]
-                        counters_ub[0, e] = 0
-                        running_ub[0] = running_ub[0] + acc_ub[0]
+                running_ub[0] = 0
+                for e in T.Pipelined(num_experts):
+                    acc_ub[0] = 0
+                    cpre_ub[0] = 0
+                    for c in T.Pipelined(actual_cores):
+                        acc_ub[0] = acc_ub[0] + ws_ub[0, c * num_experts + e]
+                        if c < cid:
+                            cpre_ub[0] = cpre_ub[0] + ws_ub[0, c * num_experts + e]
+                    offsets_ub[0, e] = running_ub[0] + cpre_ub[0]
+                    counters_ub[0, e] = 0
+                    running_ub[0] = running_ub[0] + acc_ub[0]
 
-                    for i in T.Pipelined(chunk_size):
-                        if my_start + i < E:
-                            expert = idx_ub[0, i]
-                            wp_ub[0] = offsets_ub[0, expert] + counters_ub[0, expert]
-                            counters_ub[0, expert] = counters_ub[0, expert] + 1
-                            sio_chunk_ub[0, i] = wp_ub[0]
+                for i in T.Pipelined(chunk_size):
+                    if my_start + i < E:
+                        expert = idx_ub[0, i]
+                        wp_ub[0] = offsets_ub[0, expert] + counters_ub[0, expert]
+                        counters_ub[0, expert] = counters_ub[0, expert] + 1
+                        sio_chunk_ub[0, i] = wp_ub[0]
 
-                    T.set_flag("v", "mte3", 3)
-                    T.wait_flag("v", "mte3", 3)
+                T.set_flag("v", "mte3", 3)
+                T.wait_flag("v", "mte3", 3)
 
-                    init_flag()
+                init_flag()
 
-                    if total_iters > 0:
-                        pro_src = cid * tokens_per_core
-                        pro_h_off = 0 + vid * HALF_H
-                        T.wait_flag("mte3", "mte2", 0)
-                        if pro_src < num_tokens:
-                            T.copy(tokens_gm[pro_src, pro_h_off], row_buf[0, :])
-                        T.set_flag("mte2", "v", 0)
-                        T.set_flag("mte2", "mte3", 10)
+                if total_iters > 0:
+                    pro_src = cid * tokens_per_core
+                    pro_h_off = 0 + vid * HALF_H
+                    T.wait_flag("mte3", "mte2", 0)
+                    if pro_src < num_tokens:
+                        T.copy(tokens_gm[pro_src, pro_h_off], row_buf[0, :])
+                    T.set_flag("mte2", "v", 0)
+                    T.set_flag("mte2", "mte3", 10)
 
-                    for i in T.serial(total_iters):
-                        cur = i % stages
-                        nxt = (i + 1) % stages
+                for i in T.serial(total_iters):
+                    cur = i % stages
+                    nxt = (i + 1) % stages
 
-                        cur_t = i // n_htiles
-                        cur_ht = i % n_htiles
-                        cur_src = cid * tokens_per_core + cur_t
-                        cur_h_off = cur_ht * TILE_H + vid * HALF_H
-                        cur_base = cur_t * topK
+                    cur_t = i // n_htiles
+                    cur_ht = i % n_htiles
+                    cur_src = cid * tokens_per_core + cur_t
+                    cur_h_off = cur_ht * TILE_H + vid * HALF_H
+                    cur_base = cur_t * topK
 
-                        next_i = i + 1
-                        next_t = next_i // n_htiles
-                        next_ht = next_i % n_htiles
-                        next_src = cid * tokens_per_core + next_t
-                        next_h_off = next_ht * TILE_H + vid * HALF_H
+                    next_i = i + 1
+                    next_t = next_i // n_htiles
+                    next_ht = next_i % n_htiles
+                    next_src = cid * tokens_per_core + next_t
+                    next_h_off = next_ht * TILE_H + vid * HALF_H
 
-                        has_next = next_i < total_iters
+                    has_next = next_i < total_iters
 
-                        if has_next:
-                            T.wait_flag("mte3", "mte2", nxt)
-                            if next_src < num_tokens:
-                                T.copy(tokens_gm[next_src, next_h_off], row_buf[nxt, :])
-                            T.set_flag("mte2", "v", nxt)
-                            T.set_flag("mte2", "mte3", nxt + 10)
+                    if has_next:
+                        T.wait_flag("mte3", "mte2", nxt)
+                        if next_src < num_tokens:
+                            T.copy(tokens_gm[next_src, next_h_off], row_buf[nxt, :])
+                        T.set_flag("mte2", "v", nxt)
+                        T.set_flag("mte2", "mte3", nxt + 10)
 
-                        T.wait_flag("mte2", "v", cur)
-                        T.wait_flag("mte2", "mte3", cur + 10)
+                    T.wait_flag("mte2", "v", cur)
+                    T.wait_flag("mte2", "mte3", cur + 10)
 
-                        if cur_src < num_tokens:
-                            for k in T.serial(topK):
-                                wp_ub[0] = sio_chunk_ub[0, cur_base + k]
-                                if wp_ub[0] < out_len:
-                                    T.copy(
-                                        row_buf[cur, :],
-                                        perm_out_gm[wp_ub[0], cur_h_off],
-                                    )
+                    if cur_src < num_tokens:
+                        for k in T.serial(topK):
+                            wp_ub[0] = sio_chunk_ub[0, cur_base + k]
+                            if wp_ub[0] < out_len:
+                                T.copy(
+                                    row_buf[cur, :],
+                                    perm_out_gm[wp_ub[0], cur_h_off],
+                                )
 
-                        T.set_flag("v", "mte3", cur)
-                        T.wait_flag("v", "mte3", cur)
-                        T.set_flag("mte3", "mte2", cur)
+                    T.set_flag("v", "mte3", cur)
+                    T.wait_flag("v", "mte3", cur)
+                    T.set_flag("mte3", "mte2", cur)
 
-                    clear_flag()
+                clear_flag()
 
-                    T.set_flag("v", "mte3", 2)
-                    T.wait_flag("v", "mte3", 2)
+                T.set_flag("v", "mte3", 2)
+                T.wait_flag("v", "mte3", 2)
 
-                    T.copy(sio_chunk_ub, sio_out_gm[0, my_start])
+                T.copy(sio_chunk_ub, sio_out_gm[0, my_start])
 
-                    T.set_flag("mte3", "mte2", 2)
-                    T.wait_flag("mte3", "mte2", 2)
+                T.set_flag("mte3", "mte2", 2)
+                T.wait_flag("mte3", "mte2", 2)
 
         return moe_token_permute
 
