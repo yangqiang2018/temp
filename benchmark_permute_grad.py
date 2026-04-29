@@ -10,17 +10,13 @@ def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmu
     """
     针对指定的规格对 MoeTokenPermuteGrad 和 torch_npu 原生反向算子进行 Benchmark。
     """
-    # 1. 初始化张量与前向计算 (开启 requires_grad 以追踪计算图)
     tokens = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device="npu", requires_grad=True)
     indices = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="npu")
 
-    # 运行官方前向算子，获取反向所需的 sorted_indices 和前向输出
     npu_permuted, sorted_indices = torch_npu.npu_moe_token_permute(tokens, indices)
 
-    # 模拟上游传回来的梯度
     grad_permuted_tokens = torch.randn_like(npu_permuted)
 
-    # 2. 实例化 TileLang 反向算子
     tl_grad_op = MoeTokenPermuteGrad(
         num_tokens=num_tokens,
         topK=topk,
@@ -29,13 +25,9 @@ def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmu
         dtype="float16",
     )
 
-    # ==========================================
-    # 测试 TileLang (tl_grad_op)
-    # ==========================================
     start_tl = torch_npu.npu.Event(enable_timing=True)
     end_tl = torch_npu.npu.Event(enable_timing=True)
 
-    # warmup
     for _ in range(warmup):
         tl_grad_op(grad_permuted_tokens, sorted_indices)
     torch_npu.npu.synchronize()
@@ -48,13 +40,9 @@ def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmu
 
     tl_avg_time = start_tl.elapsed_time(end_tl) / iters
 
-    # ==========================================
-    # 测试 Torch NPU 原生反向算子
-    # ==========================================
     start_torch = torch_npu.npu.Event(enable_timing=True)
     end_torch = torch_npu.npu.Event(enable_timing=True)
 
-    # 使用 torch.autograd.grad 直接触发反向计算并保留计算图 (retain_graph=True)
     def run_torch_backward():
         torch.autograd.grad(
             outputs=npu_permuted,
@@ -63,7 +51,6 @@ def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmu
             retain_graph=True,
         )
 
-    # warmup
     for _ in range(warmup):
         run_torch_backward()
     torch_npu.npu.synchronize()
@@ -76,7 +63,6 @@ def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmu
 
     torch_avg_time = start_torch.elapsed_time(end_torch) / iters
 
-    # 清理 NPU 显存（函数返回时 locals 自动释放，这里只显式清 cache）
     torch_npu.npu.empty_cache()
 
     return tl_avg_time, torch_avg_time
@@ -84,7 +70,6 @@ def benchmark_moe_permute_grad(num_tokens, hidden_size, topk, num_experts, warmu
 
 if __name__ == "__main__":
     configs = [
-        # num_tokens, hidden_size, topk, num_experts
         (8 * 1024, 7168, 8, 256, "super large"),
         (4 * 1024, 7168, 8, 256, "large"),
         (16, 16, 4, 4, "small"),
