@@ -2,7 +2,10 @@ import os
 import torch
 import torch_npu
 
-from moe_token_permute_grad import MoeTokenPermuteGrad as _OrigMoeTokenPermuteGrad
+try:
+    from .moe_token_permute_grad import MoeTokenPermuteGrad as _OrigMoeTokenPermuteGrad
+except ImportError:
+    from moe_token_permute_grad import MoeTokenPermuteGrad as _OrigMoeTokenPermuteGrad
 
 
 class MoeTokenPermuteGrad(_OrigMoeTokenPermuteGrad):
